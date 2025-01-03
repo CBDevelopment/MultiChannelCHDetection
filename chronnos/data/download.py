@@ -30,7 +30,7 @@ class DataSetFetcher:
         resolution: the resolution for pre-processing the maps or None for no pre-processing (512 for standard CHRONNOS)
     """
 
-    def __init__(self, ds_path, num_worker_threads=8, hmi_series='hmi.M_720s', resolution: int = None):
+    def __init__(self, ds_path, num_worker_threads=8, hmi_series='hmi.M_720s', resolution: int = None, max_retries=2):
         """Init the DataSetFetcher."""
         self.ds_path = ds_path
         self.resolution = resolution
@@ -38,6 +38,7 @@ class DataSetFetcher:
         os.makedirs(ds_path, exist_ok=True)
         [os.makedirs(os.path.join(ds_path, dir), exist_ok=True) for dir in self.dirs]
         self.hmi_series = hmi_series
+        self.max_retries = max_retries
 
         logging.basicConfig(
             level=logging.INFO,
@@ -46,7 +47,7 @@ class DataSetFetcher:
                 logging.StreamHandler()
             ])
 
-        self.drms_client = drms.Client(verbose=False)
+        self.drms_client = drms.Client()
         self.download_queue = JoinableQueue(ctx=multiprocessing.get_context())
         for i in range(num_worker_threads):
             t = threading.Thread(target=self.download_worker)
@@ -54,8 +55,16 @@ class DataSetFetcher:
 
     def download_worker(self):
         """Worker thread for data download"""
+
+        retries_counter = {}
+
         while True:
             header, segment, t = self.download_queue.get()
+
+            task_id = (header['DATE__OBS'], header['WAVELNTH'])
+            if task_id not in retries_counter:
+                retries_counter[task_id] = 0
+
             logging.info('Start download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
             dir = os.path.join(self.ds_path, '%d' % header['WAVELNTH'])
             map_path = os.path.join(dir, '%s.fits' % t.isoformat('T', timespec='seconds').replace(':', ''))
@@ -75,7 +84,14 @@ class DataSetFetcher:
             except Exception as ex:
                 logging.info('Download failed: %s (requeue)' % header['DATE__OBS'])
                 logging.info(ex)
-                self.download_queue.put((header, segment, t))
+
+                retries_counter[task_id] += 1
+                if retries_counter[task_id] < self.max_retries:
+                    self.download_queue.put((header, segment, t))  # Requeue the task
+                else:
+                    logging.info(f'Max retries reached for task {task_id}, skipping.')
+                    retries_counter.pop(task_id)
+                    
                 self.download_queue.task_done()
                 continue
             s_map = Map(data, header)
