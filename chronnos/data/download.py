@@ -269,7 +269,6 @@ class DataSetFetcher:
 
         # Query EUV with ThreadPoolExecutor
         header_euv, segment_euv = [], []
-        t = time - timedelta(minutes=10)
         logging.info(f"Starting EUV queries for time: {t.isoformat()}")
         
         with ThreadPoolExecutor(max_workers=7) as executor:
