@@ -42,7 +42,7 @@ class DataSetFetcher:
         self.num_worker_threads = num_worker_threads
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             handlers=[
                 logging.FileHandler("{0}/{1}.log".format(ds_path, "info_log")),
                 logging.StreamHandler()
@@ -71,11 +71,12 @@ class DataSetFetcher:
             if task_id not in retries_counter:
                 retries_counter[task_id] = 0
 
-            logging.info('Start download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
+            logging.info('Worker Thread Started - Downloading: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
             dir = os.path.join(self.ds_path, '%d' % header['WAVELNTH'])
             obs_time = header.get('DATE_OBS', t.isoformat('T', timespec='seconds'))
             map_path = os.path.join(dir, '%s.fits' % obs_time.replace(':', ''))
             if os.path.exists(map_path):
+                logging.info(f'File already exists: {map_path}, skipping download.')
                 self.download_queue.task_done()
                 continue
             try:
@@ -89,26 +90,26 @@ class DataSetFetcher:
                 header = {k: v for k, v in header.items() if not pd.isna(v)}
                 header['DATE_OBS'] = header['DATE__OBS']
             except Exception as ex:
-                logging.info('Download failed: %s (requeue)' % header['DATE__OBS'])
-                logging.info(ex)
-
+                logging.error(f'Download failed: {header["DATE__OBS"]} (requeue) - Error: {str(ex)}')
                 retries_counter[task_id] += 1
                 if retries_counter[task_id] < self.max_retries:
                     self.download_queue.put((header, segment, t))  # Requeue the task
                 else:
-                    logging.info(f'Max retries reached for task {task_id}, skipping.')
+                    logging.error(f'Max retries reached for task {task_id}, skipping.')
                     retries_counter.pop(task_id)
                     
                 self.download_queue.task_done()
                 continue
             s_map = Map(data, header)
             if self.resolution:
+                logging.info(f'Pre-processing map with resolution: {self.resolution}')
                 s_map = prepMap(s_map, self.resolution)
             if os.path.exists(map_path):
+                logging.info(f'Removing existing file: {map_path}')
                 os.remove(map_path)
             s_map.save(map_path)
             self.download_queue.task_done()
-            logging.info('Finished download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
+            logging.info('Worker Thread Finished Download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
 
         self.thread_event.set()
 
@@ -121,12 +122,12 @@ class DataSetFetcher:
             if all([os.path.exists(os.path.join(self.ds_path, dir,
                                                 date.isoformat('T', timespec='seconds').replace(':', '') + '.fits'))
                     for dir in self.dirs]):
+                logging.info(f"Skipping {date.isoformat()} as all data already exists.")
                 continue
             try:
                 self.fetchData(date)
             except Exception as ex:
-                logging.error(traceback.format_exc())
-                logging.error('Unable to download: %s' % date.isoformat())
+                logging.error(f"Error fetching data for {date.isoformat()}: {traceback.format_exc()}")
 
         for _ in range(self.num_worker_threads):
             self.download_queue.put((None, None, None))
@@ -146,6 +147,7 @@ class DataSetFetcher:
         keys_hmi = self.drms_client.keys(ds_hmi)
         header_hmi, segment_hmi = self.drms_client.query(ds_hmi, key=','.join(keys_hmi), seg='magnetogram')
         if len(header_hmi) != 1 or np.any(header_hmi.QUALITY != 0):
+            logging.error(f'HMI data not valid for {time.isoformat()}. Fallback to alternative data.')
             self.fetchDataFallback(time)
             return
 
@@ -155,24 +157,27 @@ class DataSetFetcher:
         keys_euv = self.drms_client.keys(ds_euv)
         header_euv, segment_euv = self.drms_client.query(ds_euv, key=','.join(keys_euv), seg='image')
         if len(header_euv) != 7 or np.any(header_euv.QUALITY != 0):
+            logging.error(f'EUV data not valid for {time.isoformat()}. Fallback to alternative data.')
             self.fetchDataFallback(time)
             return
 
         for (idx, h), s in zip(header_hmi.iterrows(), segment_hmi.magnetogram):
+            logging.debug(f"Putting task into queue: HMI {h['DATE__OBS']}")
             self.download_queue.put((h.to_dict(), s, time))
         for (idx, h), s in zip(header_euv.iterrows(), segment_euv.image):
+            logging.debug(f"Putting task into queue: EUV {h['DATE__OBS']}")
             self.download_queue.put((h.to_dict(), s, time))
 
     def fetchDataFallback(self, time):
-        """Alternative download method in case of errors.
+        """Alternative download method in case of errors, with parallel EUV querying.
 
         :param time: datetime to download
         """
         id = time.isoformat()
 
-        logging.info('Fallback download: %s' % id)
+        logging.info(f'Fallback download: {id}')
         # query Magnetogram
-        t = time - timedelta(hours=6)
+        t = time - timedelta(minutes=1)
         ds_hmi = 'hmi.M_720s[%sZ/12h@720s]{magnetogram}' % t.replace(tzinfo=None).isoformat('_', timespec='seconds')
         keys_hmi = self.drms_client.keys(ds_hmi)
         header_tmp, segment_tmp = self.drms_client.query(ds_hmi, key=','.join(keys_hmi), seg='magnetogram')
@@ -188,10 +193,12 @@ class DataSetFetcher:
         header_tmp = header_tmp[cond_tmp]
         segment_tmp = segment_tmp[cond_tmp]
         if header_tmp.empty:
+            logging.error("No valid HMI data found after filtering.")
             raise ValueError("No valid HMI data found after filtering. Possible issue with QUALITY flag.")
 
         header_hmi = header_tmp.iloc[0].drop('date_diff')
         segment_hmi = segment_tmp.iloc[0].drop('date_diff')
+
         ############################################################
         # query EUV with parallelization using ThreadPoolExecutor
         header_euv, segment_euv = [], []
@@ -234,6 +241,7 @@ class DataSetFetcher:
             
             obs_time_euv.append(obs_time)
         for h, s, obs_time in zip(header_euv, segment_euv, obs_time_euv):
+            logging.debug(f"Putting EUV task into queue: {obs_time.isoformat()}")
             self.download_queue.put((h.to_dict(), s.image, obs_time))
 
     def query_euv(self, euv_ds, wavelength, time):
