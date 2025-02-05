@@ -11,7 +11,8 @@ from io import BytesIO
 import drms
 import numpy as np
 import pandas as pd
-from astropy.io.fits import HDUList
+from astropy.io.fits import HDUList, PrimaryHDU, Header
+from astropy.io.fits.hdu.compressed import CompImageHDU
 from dateutil.parser import parse
 from sunpy.map import Map
 from concurrent.futures import ThreadPoolExecutor
@@ -95,7 +96,14 @@ class DataSetFetcher:
                     s_map = prepMap(s_map, self.resolution)
                 if os.path.exists(map_path):
                     os.remove(map_path)
-                s_map.save(map_path)
+                # s_map.save(map_path)
+                compressed_fits = CompImageHDU(
+                    data=s_map.data, 
+                    header=Header(s_map.meta),
+                    compression_type='HCOMPRESS_1',
+                    quantize_level=16.0)
+                compressed_hdul = HDUList([PrimaryHDU(), compressed_fits])
+                compressed_hdul.writeto(map_path)
                 
                 logging.info(f'Downloaded: {obs_time} / {header["WAVELNTH"]}')
                 break
