@@ -17,7 +17,7 @@ from dateutil.parser import parse
 from sunpy.map import Map
 
 from chronnos.data.convert import prepMap
-
+from concurrent.futures import ThreadPoolExecutor
 
 class DataSetFetcher:
     """"""
@@ -39,6 +39,7 @@ class DataSetFetcher:
         [os.makedirs(os.path.join(ds_path, dir), exist_ok=True) for dir in self.dirs]
         self.hmi_series = hmi_series
         self.max_retries = max_retries
+        self.num_worker_threads = num_worker_threads
 
         logging.basicConfig(
             level=logging.INFO,
@@ -49,7 +50,8 @@ class DataSetFetcher:
 
         self.drms_client = drms.Client()
         self.download_queue = JoinableQueue(ctx=multiprocessing.get_context())
-        for i in range(num_worker_threads):
+        self.thread_event = threading.Event()
+        for i in range(self.num_worker_threads):
             t = threading.Thread(target=self.download_worker)
             t.start()
 
@@ -61,13 +63,18 @@ class DataSetFetcher:
         while True:
             header, segment, t = self.download_queue.get()
 
+            if header is None:  # Sentinel value to stop the thread
+                self.download_queue.task_done()
+                break  # Exit the loop and terminate this thread
+
             task_id = (header['DATE__OBS'], header['WAVELNTH'])
             if task_id not in retries_counter:
                 retries_counter[task_id] = 0
 
             logging.info('Start download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
             dir = os.path.join(self.ds_path, '%d' % header['WAVELNTH'])
-            map_path = os.path.join(dir, '%s.fits' % t.isoformat('T', timespec='seconds').replace(':', ''))
+            obs_time = header.get('DATE_OBS', t.isoformat('T', timespec='seconds'))
+            map_path = os.path.join(dir, '%s.fits' % obs_time.replace(':', ''))
             if os.path.exists(map_path):
                 self.download_queue.task_done()
                 continue
@@ -103,6 +110,8 @@ class DataSetFetcher:
             self.download_queue.task_done()
             logging.info('Finished download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
 
+        self.thread_event.set()
+
     def fetchDates(self, dates):
         """Download the closest observations to the specified dates.
 
@@ -118,7 +127,13 @@ class DataSetFetcher:
             except Exception as ex:
                 logging.error(traceback.format_exc())
                 logging.error('Unable to download: %s' % date.isoformat())
+
+        for _ in range(self.num_worker_threads):
+            self.download_queue.put((None, None, None))
+
         self.download_queue.join()
+        self.thread_event.wait()  # Wait for the signal that all threads are finished
+        logging.info("All downloads complete.")
 
     def fetchData(self, time):
         """Adds a single date to the download queue.
@@ -172,39 +187,79 @@ class DataSetFetcher:
         cond_tmp = header_tmp.QUALITY == 0
         header_tmp = header_tmp[cond_tmp]
         segment_tmp = segment_tmp[cond_tmp]
-        assert len(header_tmp) > 0, 'No valid quality flag found'
-        # replace invalid
+        if header_tmp.empty:
+            raise ValueError("No valid HMI data found after filtering. Possible issue with QUALITY flag.")
+
         header_hmi = header_tmp.iloc[0].drop('date_diff')
         segment_hmi = segment_tmp.iloc[0].drop('date_diff')
         ############################################################
-        # query EUV
+        # query EUV with parallelization using ThreadPoolExecutor
         header_euv, segment_euv = [], []
-        t = time - timedelta(hours=6)
-        for wl in [94, 131, 171, 193, 211, 304, 335]:
-            euv_ds = 'aia.lev1_euv_12s[%sZ/12h@12s][%d]{image}' % (
-                t.replace(tzinfo=None).isoformat('_', timespec='seconds'), wl)
-            keys_euv = self.drms_client.keys(euv_ds)
-            header_tmp, segment_tmp = self.drms_client.query(euv_ds, key=','.join(keys_euv), seg='image')
-            assert len(header_tmp) != 0, 'No data found!'
-            date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')  # fix date format
-            date_diff = (pd.to_datetime(date_str).dt.tz_localize(None) - time).abs()
-            # sort and filter
-            header_tmp['date_diff'] = date_diff
-            header_tmp.sort_values('date_diff')
-            segment_tmp['date_diff'] = date_diff
-            segment_tmp.sort_values('date_diff')
-            cond_tmp = header_tmp.QUALITY == 0
-            header_tmp = header_tmp[cond_tmp]
-            segment_tmp = segment_tmp[cond_tmp]
-            assert len(header_tmp) > 0, 'No valid quality flag found'
-            # replace invalid
-            header_euv.append(header_tmp.iloc[0].drop('date_diff'))
-            segment_euv.append(segment_tmp.iloc[0].drop('date_diff'))
+        t = time - timedelta(minutes=10)
+        with ThreadPoolExecutor(max_workers=7) as executor:
+            # Launch the EUV queries in parallel
+            futures = []
+            for wl in [94, 131, 171, 193, 211, 304, 335]:
+                euv_ds = 'aia.lev1_euv_12s[%sZ/12h@12s][%d]{image}' % (
+                    t.replace(tzinfo=None).isoformat('_', timespec='seconds'), wl)
+                futures.append(executor.submit(self.query_euv, euv_ds, wl, t))
 
-        self.download_queue.put((header_hmi.to_dict(), segment_hmi.magnetogram, time))
-        for h, s in zip(header_euv, segment_euv):
-            self.download_queue.put((h.to_dict(), s.image, time))
+            # Collect results
+            for future in futures:
+                h, s = future.result()
+                header_euv.append(h)
+                segment_euv.append(s)
 
+        # Continue with the rest of the method...
+        # Attempt to get the timestamp from various possible columns
+        obs_time_hmi = header_hmi.get('DATE_OBS', None) or header_hmi.get('DATE__OBS', None) or header_hmi.get('DATE', None)
+        
+        if obs_time_hmi:
+            obs_time_hmi = pd.to_datetime(obs_time_hmi).tz_localize(None)
+        else:
+            # If no valid timestamp is found, fallback to the requested time
+            obs_time_hmi = time  # Using `time` as a fallback
+        self.download_queue.put((header_hmi.to_dict(), segment_hmi.magnetogram, obs_time_hmi))
+
+        obs_time_euv = []
+        for h in header_euv:
+            # Attempt to get the timestamp from various possible columns
+            obs_time = h.get('DATE_OBS', None) or h.get('DATE__OBS', None) or h.get('DATE', None)
+            
+            if obs_time:
+                obs_time = pd.to_datetime(obs_time).tz_localize(None)
+            else:
+                # If no valid timestamp is found, fallback to the requested time
+                obs_time = time  # Using `time` as a fallback
+            
+            obs_time_euv.append(obs_time)
+        for h, s, obs_time in zip(header_euv, segment_euv, obs_time_euv):
+            self.download_queue.put((h.to_dict(), s.image, obs_time))
+
+    def query_euv(self, euv_ds, wavelength, time):
+        """Helper function to query a single EUV dataset and return results.
+
+        :param euv_ds: the dataset string for the EUV query
+        :param wavelength: the wavelength for the query
+        :param time: the time to query
+        :returns: tuple (header, segment)
+        """
+        keys_euv = self.drms_client.keys(euv_ds)
+        header_tmp, segment_tmp = self.drms_client.query(euv_ds, key=','.join(keys_euv), seg='image')
+        assert len(header_tmp) != 0, f'No data found for EUV wavelength {wavelength}'
+        date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')  # fix date format
+        date_diff = (pd.to_datetime(date_str).dt.tz_localize(None) - time).abs()
+        # sort and filter
+        header_tmp['date_diff'] = date_diff
+        header_tmp.sort_values('date_diff')
+        segment_tmp['date_diff'] = date_diff
+        segment_tmp.sort_values('date_diff')
+        cond_tmp = header_tmp.QUALITY == 0
+        header_tmp = header_tmp[cond_tmp]
+        segment_tmp = segment_tmp[cond_tmp]
+        assert len(header_tmp) > 0, 'No valid quality flag found'
+        # replace invalid
+        return header_tmp.iloc[0].drop('date_diff'), segment_tmp.iloc[0].drop('date_diff')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Download AIA and HMI files for CHRONNNOS image segmenation.')
