@@ -1,13 +1,12 @@
 import argparse
 import logging
-import multiprocessing
 import os
-import threading
+import asyncio
+import aiohttp
 import traceback
 from datetime import timedelta
-from multiprocessing.queues import JoinableQueue
 from pathlib import Path
-from urllib.request import urlopen
+from io import BytesIO
 
 import drms
 import numpy as np
@@ -15,23 +14,12 @@ import pandas as pd
 from astropy.io.fits import HDUList
 from dateutil.parser import parse
 from sunpy.map import Map
-
-from chronnos.data.convert import prepMap
 from concurrent.futures import ThreadPoolExecutor
 
+from chronnos.data.convert import prepMap
+
 class DataSetFetcher:
-    """"""
-    """Download tool for JSOC.
-
-    Attributes:
-        ds_path: the path to the download directory
-        num_worker_threads: number of parallel threads being used
-        hmi_series: the JSOC series used for HMI magnetograms
-        resolution: the resolution for pre-processing the maps or None for no pre-processing (512 for standard CHRONNOS)
-    """
-
-    def __init__(self, ds_path, num_worker_threads=8, hmi_series='hmi.M_720s', resolution: int = None, max_retries=2):
-        """Init the DataSetFetcher."""
+    def __init__(self, ds_path, num_worker_threads=8, hmi_series='hmi.M_720s', resolution=None, max_retries=2):
         self.ds_path = ds_path
         self.resolution = resolution
         self.dirs = ['94', '131', '171', '193', '211', '304', '335', '6173']
@@ -40,249 +28,295 @@ class DataSetFetcher:
         self.hmi_series = hmi_series
         self.max_retries = max_retries
         self.num_worker_threads = num_worker_threads
-
+        
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=logging.INFO,
             handlers=[
-                logging.FileHandler("{0}/{1}.log".format(ds_path, "info_log")),
+                logging.FileHandler(f"{ds_path}/info_log.log"),
                 logging.StreamHandler()
             ])
-
+        
         self.drms_client = drms.Client()
-        self.download_queue = JoinableQueue(ctx=multiprocessing.get_context())
-        self.thread_event = threading.Event()
-        for i in range(self.num_worker_threads):
-            t = threading.Thread(target=self.download_worker)
-            t.start()
+        self.download_queue = asyncio.Queue()
+        self.session = None
+        self.semaphore = None
+        self.map_executor = ThreadPoolExecutor(max_workers=4)  # For parallel map processing
 
-    def download_worker(self):
-        """Worker thread for data download"""
-
-        retries_counter = {}
-
+    async def download_worker(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+            
         while True:
-            header, segment, t = self.download_queue.get()
-
-            if header is None:  # Sentinel value to stop the thread
-                self.download_queue.task_done()
-                break  # Exit the loop and terminate this thread
-
-            task_id = (header['DATE__OBS'], header['WAVELNTH'])
-            if task_id not in retries_counter:
-                retries_counter[task_id] = 0
-
-            logging.info('Worker Thread Started - Downloading: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
-            dir = os.path.join(self.ds_path, '%d' % header['WAVELNTH'])
-            obs_time = header.get('DATE_OBS', t.isoformat('T', timespec='seconds'))
-            map_path = os.path.join(dir, '%s.fits' % obs_time.replace(':', ''))
-            if os.path.exists(map_path):
-                logging.info(f'File already exists: {map_path}, skipping download.')
-                self.download_queue.task_done()
-                continue
             try:
-                # load map
+                task = await self.download_queue.get()
+                if task is None:
+                    self.download_queue.task_done()
+                    break
+
+                header, segment, t = task
+                await self.process_download(header, segment, t)
+                self.download_queue.task_done()
+                
+            except Exception as e:
+                logging.error(f"Worker error: {str(e)}")
+                self.download_queue.task_done()
+
+    async def process_download(self, header, segment, t):
+        wavelength = int(header['WAVELNTH'])
+        dir = os.path.join(self.ds_path, str(wavelength))
+        obs_time = header['DATE__OBS']
+        # Format timestamp as YYYY-MM-DDTHHMMSS
+        formatted_time = pd.to_datetime(obs_time).strftime('%Y-%m-%dT%H%M%S')
+        map_path = os.path.join(dir, f"{formatted_time}.fits")
+        logging.info(f"Processing {wavelength}A data for {formatted_time}")
+
+        if os.path.exists(map_path):
+            logging.info(f'File exists: {map_path}, skipping.')
+            return
+
+        for attempt in range(self.max_retries):
+            try:
                 url = 'http://jsoc.stanford.edu' + segment
-                url_request = urlopen(url)
-                fits_data = url_request.read()
+                logging.info(f"Downloading from JSOC: {wavelength}A")
+                async with self.session.get(url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"HTTP {response.status}")
+                    fits_data = await response.read()
+                    logging.info(f"Download complete for {wavelength}A")
+                
                 hdul = HDUList.fromstring(fits_data)
                 hdul.verify('silentfix')
                 data = hdul[1].data
                 header = {k: v for k, v in header.items() if not pd.isna(v)}
                 header['DATE_OBS'] = header['DATE__OBS']
-            except Exception as ex:
-                logging.error(f'Download failed: {header["DATE__OBS"]} (requeue) - Error: {str(ex)}')
-                retries_counter[task_id] += 1
-                if retries_counter[task_id] < self.max_retries:
-                    self.download_queue.put((header, segment, t))  # Requeue the task
+                
+                s_map = Map(data, header)
+                if self.resolution:
+                    s_map = prepMap(s_map, self.resolution)
+                if os.path.exists(map_path):
+                    os.remove(map_path)
+                s_map.save(map_path)
+                
+                logging.info(f'Downloaded: {obs_time} / {header["WAVELNTH"]}')
+                break
+                
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logging.warning(f'Retry {attempt + 1}/{self.max_retries} after {wait_time}s: {str(e)}')
+                    await asyncio.sleep(wait_time)
                 else:
-                    logging.error(f'Max retries reached for task {task_id}, skipping.')
-                    retries_counter.pop(task_id)
-                    
-                self.download_queue.task_done()
-                continue
-            s_map = Map(data, header)
-            if self.resolution:
-                logging.info(f'Pre-processing map with resolution: {self.resolution}')
-                s_map = prepMap(s_map, self.resolution)
-            if os.path.exists(map_path):
-                logging.info(f'Removing existing file: {map_path}')
-                os.remove(map_path)
-            s_map.save(map_path)
-            self.download_queue.task_done()
-            logging.info('Worker Thread Finished Download: %s / %s' % (t.isoformat(' '), header['WAVELNTH']))
+                    logging.error(f'Failed after {self.max_retries} attempts: {str(e)}')
+                    raise
 
-        self.thread_event.set()
+    async def fetchDates(self, dates):
+        if not self.session:
+            connector = aiohttp.TCPConnector(limit=self.num_worker_threads, force_close=True)
+            self.session = aiohttp.ClientSession(connector=connector)
+            self.semaphore = asyncio.Semaphore(self.num_worker_threads)
+        
+        workers = [asyncio.create_task(self.download_worker()) 
+                  for _ in range(self.num_worker_threads)]
+        
+        try:
+            for date in dates:
+                if all([os.path.exists(os.path.join(self.ds_path, dir,
+                                     date.isoformat('T', timespec='seconds').replace(':', '') + '.fits'))
+                        for dir in self.dirs]):
+                    logging.info(f"Skipping {date.isoformat()}, data exists.")
+                    continue
+                try:
+                    await self.fetchData(date)
+                except Exception as ex:
+                    logging.error(f"Error fetching {date.isoformat()}: {traceback.format_exc()}")
 
-    def fetchDates(self, dates):
-        """Download the closest observations to the specified dates.
+            for _ in range(self.num_worker_threads):
+                await self.download_queue.put(None)
 
-        :param dates: list of datetime dates to download
-        """
-        for date in dates:
-            if all([os.path.exists(os.path.join(self.ds_path, dir,
-                                                date.isoformat('T', timespec='seconds').replace(':', '') + '.fits'))
-                    for dir in self.dirs]):
-                logging.info(f"Skipping {date.isoformat()} as all data already exists.")
-                continue
-            try:
-                self.fetchData(date)
-            except Exception as ex:
-                logging.error(f"Error fetching data for {date.isoformat()}: {traceback.format_exc()}")
+            await self.download_queue.join()
+            await asyncio.gather(*workers)
+            
+        finally:
+            if self.session:
+                await self.session.close()
+                self.session = None
+            self.map_executor.shutdown()
 
-        for _ in range(self.num_worker_threads):
-            self.download_queue.put((None, None, None))
-
-        self.download_queue.join()
-        self.thread_event.wait()  # Wait for the signal that all threads are finished
-        logging.info("All downloads complete.")
-
-    def fetchData(self, time):
-        """Adds a single date to the download queue.
-
-        :param time: datetime to download
-        """
-        # query Magnetogram
-        time_param = '%sZ' % time.isoformat('_', timespec='seconds')
-        ds_hmi = '%s[%s]{magnetogram}' % (self.hmi_series, time_param)
+    async def fetchData(self, time):
+        logging.info(f"\nFetching data for timestamp: {time.isoformat()}")
+        time_param = f"{time.isoformat('_', timespec='seconds')}Z"
+        
+        # Query Magnetogram
+        ds_hmi = f"{self.hmi_series}[{time_param}]{{magnetogram}}"
         keys_hmi = self.drms_client.keys(ds_hmi)
         header_hmi, segment_hmi = self.drms_client.query(ds_hmi, key=','.join(keys_hmi), seg='magnetogram')
+        
         if len(header_hmi) != 1 or np.any(header_hmi.QUALITY != 0):
-            logging.error(f'HMI data not valid for {time.isoformat()}. Fallback to alternative data.')
-            self.fetchDataFallback(time)
+            logging.error(f'HMI data not valid for {time.isoformat()}. Using fallback.')
+            await self.fetchDataFallback(time)
             return
 
-        # query EUV
-        time_param = '%sZ' % time.isoformat('_', timespec='seconds')
-        ds_euv = 'aia.lev1_euv_12s[%s]{image}' % time_param
+        # Query EUV
+        ds_euv = f'aia.lev1_euv_12s[{time_param}]{{image}}'
         keys_euv = self.drms_client.keys(ds_euv)
         header_euv, segment_euv = self.drms_client.query(ds_euv, key=','.join(keys_euv), seg='image')
+        
         if len(header_euv) != 7 or np.any(header_euv.QUALITY != 0):
-            logging.error(f'EUV data not valid for {time.isoformat()}. Fallback to alternative data.')
-            self.fetchDataFallback(time)
+            logging.error(f'EUV data not valid for {time.isoformat()}. Using fallback.')
+            await self.fetchDataFallback(time)
             return
 
         for (idx, h), s in zip(header_hmi.iterrows(), segment_hmi.magnetogram):
-            logging.debug(f"Putting task into queue: HMI {h['DATE__OBS']}")
-            self.download_queue.put((h.to_dict(), s, time))
+            await self.download_queue.put((h.to_dict(), s, time))
         for (idx, h), s in zip(header_euv.iterrows(), segment_euv.image):
-            logging.debug(f"Putting task into queue: EUV {h['DATE__OBS']}")
-            self.download_queue.put((h.to_dict(), s, time))
+            await self.download_queue.put((h.to_dict(), s, time))
 
-    def fetchDataFallback(self, time):
-        """Alternative download method in case of errors, with parallel EUV querying.
+    def query_euv(self, euv_ds, wavelength, time):
+        """Query EUV data efficiently with optimized DataFrame handling."""
+        keys_euv = self.drms_client.keys(euv_ds)
+        header_tmp, segment_tmp = self.drms_client.query(euv_ds, key=','.join(keys_euv), seg='image')
+        
+        if len(header_tmp) == 0:
+            raise ValueError(f'No data found for EUV wavelength {wavelength}')
+            
+        # Create date differences efficiently
+        date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')
+        date_diff = (pd.to_datetime(date_str).dt.tz_localize(None) - time).abs()
+        
+        # Create new DataFrames with all data at once
+        header_df = pd.DataFrame({
+            **{col: header_tmp[col] for col in header_tmp.columns},
+            'date_diff': date_diff
+        })
+        
+        segment_df = pd.DataFrame({
+            **{col: segment_tmp[col] for col in segment_tmp.columns},
+            'date_diff': date_diff
+        })
+        
+        # Sort and filter
+        header_df = header_df.sort_values('date_diff')
+        segment_df = segment_df.sort_values('date_diff')
+        
+        # Apply quality filter
+        quality_mask = header_df.QUALITY == 0
+        header_df = header_df[quality_mask]
+        segment_df = segment_df[quality_mask]
+        
+        if len(header_df) == 0:
+            raise ValueError('No valid quality flag found')
+        
+        # Return first row without date_diff
+        return (
+            header_df.iloc[0].drop('date_diff'),
+            segment_df.iloc[0].drop('date_diff')
+        )
 
-        :param time: datetime to download
-        """
-        id = time.isoformat()
-
-        logging.info(f'Fallback download: {id}')
-        # query Magnetogram
+    async def fetchDataFallback(self, time):
+        """Optimized fallback method for data fetching."""
+        logging.info(f"\nUsing fallback method for {time.isoformat()}")
         t = time - timedelta(minutes=1)
-        ds_hmi = 'hmi.M_720s[%sZ/12h@720s]{magnetogram}' % t.replace(tzinfo=None).isoformat('_', timespec='seconds')
+        
+        # Query Magnetogram
+        ds_hmi = f'hmi.M_720s[{t.replace(tzinfo=None).isoformat("_", timespec="seconds")}Z/12h@720s]{{magnetogram}}'
+        logging.info(f"Querying magnetogram with dataset: {ds_hmi}")
+        
         keys_hmi = self.drms_client.keys(ds_hmi)
         header_tmp, segment_tmp = self.drms_client.query(ds_hmi, key=','.join(keys_hmi), seg='magnetogram')
-        assert len(header_tmp) != 0, 'No data found!'
-        date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')  # fix date format
+        
+        if len(header_tmp) == 0:
+            logging.error('No magnetogram data found in query')
+            raise ValueError('No data found!')
+        
+        # Process magnetogram data efficiently
+        date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')
         date_diff = np.abs(pd.to_datetime(date_str).dt.tz_localize(None) - time)
-        # sort and filter
-        header_tmp['date_diff'] = date_diff
-        header_tmp.sort_values('date_diff')
-        segment_tmp['date_diff'] = date_diff
-        segment_tmp.sort_values('date_diff')
-        cond_tmp = header_tmp.QUALITY == 0
-        header_tmp = header_tmp[cond_tmp]
-        segment_tmp = segment_tmp[cond_tmp]
-        if header_tmp.empty:
-            logging.error("No valid HMI data found after filtering.")
-            raise ValueError("No valid HMI data found after filtering. Possible issue with QUALITY flag.")
+        
+        # Create new DataFrames with all data at once
+        header_df = pd.DataFrame({
+            **{col: header_tmp[col] for col in header_tmp.columns},
+            'date_diff': date_diff
+        })
+        
+        segment_df = pd.DataFrame({
+            **{col: segment_tmp[col] for col in segment_tmp.columns},
+            'date_diff': date_diff
+        })
+        
+        # Sort and filter
+        header_df = header_df.sort_values('date_diff')
+        segment_df = segment_df.sort_values('date_diff')
+        
+        quality_mask = header_df.QUALITY == 0
+        header_df = header_df[quality_mask]
+        segment_df = segment_df[quality_mask]
+        
+        if header_df.empty:
+            logging.error("No valid HMI data found after quality filtering")
+            raise ValueError("No valid HMI data found after filtering.")
 
-        header_hmi = header_tmp.iloc[0].drop('date_diff')
-        segment_hmi = segment_tmp.iloc[0].drop('date_diff')
+        logging.info(f"Found valid magnetogram data with time difference: {header_df.iloc[0]['date_diff']}")
+        header_hmi = header_df.iloc[0].drop('date_diff')
+        segment_hmi = segment_df.iloc[0].drop('date_diff')
 
-        ############################################################
-        # query EUV with parallelization using ThreadPoolExecutor
+        # Query EUV with ThreadPoolExecutor
         header_euv, segment_euv = [], []
         t = time - timedelta(minutes=10)
+        logging.info(f"Starting EUV queries for time: {t.isoformat()}")
+        
         with ThreadPoolExecutor(max_workers=7) as executor:
-            # Launch the EUV queries in parallel
             futures = []
             for wl in [94, 131, 171, 193, 211, 304, 335]:
-                euv_ds = 'aia.lev1_euv_12s[%sZ/12h@12s][%d]{image}' % (
-                    t.replace(tzinfo=None).isoformat('_', timespec='seconds'), wl)
+                euv_ds = f'aia.lev1_euv_12s[{t.replace(tzinfo=None).isoformat("_", timespec="seconds")}Z/12h@12s][{wl}]{{image}}'
+                logging.debug(f"Querying EUV wavelength {wl}Å with dataset: {euv_ds}")
                 futures.append(executor.submit(self.query_euv, euv_ds, wl, t))
 
-            # Collect results
             for future in futures:
                 h, s = future.result()
                 header_euv.append(h)
                 segment_euv.append(s)
 
-        # Continue with the rest of the method...
-        # Attempt to get the timestamp from various possible columns
-        obs_time_hmi = header_hmi.get('DATE_OBS', None) or header_hmi.get('DATE__OBS', None) or header_hmi.get('DATE', None)
+        logging.info(f"Successfully retrieved all EUV data for {len(futures)} wavelengths")
+
+        await self.download_queue.put((header_hmi.to_dict(), segment_hmi.magnetogram, time))
+        logging.debug("Added magnetogram data to download queue")
         
-        if obs_time_hmi:
-            obs_time_hmi = pd.to_datetime(obs_time_hmi).tz_localize(None)
-        else:
-            # If no valid timestamp is found, fallback to the requested time
-            obs_time_hmi = time  # Using `time` as a fallback
-        self.download_queue.put((header_hmi.to_dict(), segment_hmi.magnetogram, obs_time_hmi))
+        for h, s in zip(header_euv, segment_euv):
+            await self.download_queue.put((h.to_dict(), s.image, time))
+            logging.debug(f"Added EUV data for wavelength {h.get('WAVELNTH', 'unknown')}Å to download queue")
+        
+        logging.info(f"Completed fallback data fetch for {time.isoformat()}")
 
-        obs_time_euv = []
-        for h in header_euv:
-            # Attempt to get the timestamp from various possible columns
-            obs_time = h.get('DATE_OBS', None) or h.get('DATE__OBS', None) or h.get('DATE', None)
-            
-            if obs_time:
-                obs_time = pd.to_datetime(obs_time).tz_localize(None)
-            else:
-                # If no valid timestamp is found, fallback to the requested time
-                obs_time = time  # Using `time` as a fallback
-            
-            obs_time_euv.append(obs_time)
-        for h, s, obs_time in zip(header_euv, segment_euv, obs_time_euv):
-            logging.debug(f"Putting EUV task into queue: {obs_time.isoformat()}")
-            self.download_queue.put((h.to_dict(), s.image, obs_time))
-
-    def query_euv(self, euv_ds, wavelength, time):
-        """Helper function to query a single EUV dataset and return results.
-
-        :param euv_ds: the dataset string for the EUV query
-        :param wavelength: the wavelength for the query
-        :param time: the time to query
-        :returns: tuple (header, segment)
-        """
-        keys_euv = self.drms_client.keys(euv_ds)
-        header_tmp, segment_tmp = self.drms_client.query(euv_ds, key=','.join(keys_euv), seg='image')
-        assert len(header_tmp) != 0, f'No data found for EUV wavelength {wavelength}'
-        date_str = header_tmp['DATE__OBS'].replace('MISSING', '').str.replace('60', '59')  # fix date format
-        date_diff = (pd.to_datetime(date_str).dt.tz_localize(None) - time).abs()
-        # sort and filter
-        header_tmp['date_diff'] = date_diff
-        header_tmp.sort_values('date_diff')
-        segment_tmp['date_diff'] = date_diff
-        segment_tmp.sort_values('date_diff')
-        cond_tmp = header_tmp.QUALITY == 0
-        header_tmp = header_tmp[cond_tmp]
-        segment_tmp = segment_tmp[cond_tmp]
-        assert len(header_tmp) > 0, 'No valid quality flag found'
-        # replace invalid
-        return header_tmp.iloc[0].drop('date_diff'), segment_tmp.iloc[0].drop('date_diff')
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Download AIA and HMI files for CHRONNNOS image segmenation.')
-    parser.add_argument('--path', type=str, help='the path to the storage directory',
-                        default=os.path.join(Path.home(), 'chronnos'))
-    parser.add_argument('--dates', nargs='*', type=lambda s: parse(s), help='dates in dateutil parseable format')
-    parser.add_argument('--hmi_series', type=str, help='jsoc hmi series (hmi.M_720s or hmi.M_45s)',
-                        default='hmi.M_720s')
-    parser.add_argument('--n_workers', type=int, help='number of parallel threads used for download',
-                        default=8)
-    parser.add_argument('--resolution', type=int, help='the resolution for pre-processing the maps or None for no pre-processing (512 for standard CHRONNOS)',
-                        default=None)
+async def main():
+    import time
+    parser = argparse.ArgumentParser(description='Download AIA and HMI files for CHRONNNOS image segmentation.')
+    parser.add_argument('--path', type=str, default=os.path.join(Path.home(), 'chronnos'))
+    parser.add_argument('--dates', nargs='*', type=lambda s: parse(s))
+    parser.add_argument('--hmi_series', type=str, default='hmi.M_720s')
+    parser.add_argument('--n_workers', type=int, default=8)
+    parser.add_argument('--resolution', type=int, default=None)
 
     args = parser.parse_args()
+    
+    start_time = time.time()
+    logging.info("Starting download process")
+    
+    fetcher = DataSetFetcher(
+        ds_path=args.path,
+        hmi_series=args.hmi_series,
+        num_worker_threads=args.n_workers,
+        resolution=args.resolution
+    )
+    await fetcher.fetchDates(args.dates)
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    hours = int(elapsed_time // 3600)
+    minutes = int((elapsed_time % 3600) // 60)
+    seconds = int(elapsed_time % 60)
+    
+    logging.info(f"Total processing time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    logging.info("Download process complete")
 
-    fetcher = DataSetFetcher(ds_path=args.path, hmi_series=args.hmi_series, num_worker_threads=args.n_workers,
-                             resolution=args.resolution)
-    fetcher.fetchDates(args.dates)
+if __name__ == '__main__':
+    asyncio.run(main())
