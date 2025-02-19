@@ -30,6 +30,7 @@ class Trainer:
         self.channels = channels
 
         os.makedirs(base_path, exist_ok=True)
+        print(f"Checking if base path {base_path} exists: {os.path.exists(base_path)}")
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device is None else device
         logging.info('Using device: %s' % self.device)
