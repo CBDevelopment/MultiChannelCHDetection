@@ -32,7 +32,7 @@ class FITSDataset(Dataset):
 
 
 class MapDataset(Dataset):
-    def __init__(self, files, channel=None):
+    def __init__(self, files, channel=None, compressed=False):
         """
         Load saved maps for model training.
         :param files: list of npy files
@@ -40,11 +40,15 @@ class MapDataset(Dataset):
         """
         self.files = files
         self.channel = None if channel is None else channel if isinstance(channel, list) else [channel]
+        self.compressed = compressed
         super().__init__()
 
     def __getitem__(self, index):
         file = self.files[index]
-        x = np.load(file)
+        if self.compressed:
+            x = np.load(file, allow_pickle=True)['data']
+        else:
+            x = np.load(file)
         x = x * 2 - 1  # scale to [-1, 1]
         x = np.transpose(x, axes=[2, 0, 1])
         if self.channel is not None:
@@ -56,17 +60,21 @@ class MapDataset(Dataset):
 
 
 class MaskDataset(Dataset):
-    def __init__(self, files):
+    def __init__(self, files, compressed=False):
         """
         Load saved masks for model training.
         :param files: list of npy files
         """
         self.files = files
+        self.compressed = compressed
         super().__init__()
 
     def __getitem__(self, index):
         file = self.files[index]
-        y = np.load(file)
+        if self.compressed:
+            y = np.load(file, allow_pickle=True)['data']
+        else:
+            y = np.load(file)
         y = (y >= 0.1).astype(np.float32)  # make hard labels
         y = np.transpose(y, axes=[2, 0, 1])
         return np.array(y.data.tolist(), dtype=np.float32)
@@ -104,7 +112,7 @@ class CombinedCHDataset(Dataset):
         return len(self.map_ds)
 
 
-def getDataSet(ds_path, resolution, train_months=None):
+def getDataSet(ds_path, resolution, train_months=None, compressed=False):
     """
     Group files for model training
     :param ds_path: base path to the converted files
@@ -113,8 +121,12 @@ def getDataSet(ds_path, resolution, train_months=None):
     :return:
     """
     train_months = list(range(1, 11)) if train_months is None else train_months
-    mask_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'mask', '%d' % resolution), '*.npy')))
-    map_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'map', '%d' % resolution), '*.npy')))
+    if compressed:
+        mask_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'mask', '%d' % resolution), '*.npz')))
+        map_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'map', '%d' % resolution), '*.npz')))
+    else:
+        mask_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'mask', '%d' % resolution), '*.npy')))
+        map_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'map', '%d' % resolution), '*.npy')))
 
     basename_mask = [os.path.basename(f) for f in mask_files]
     basename_map = [os.path.basename(f) for f in map_files]
