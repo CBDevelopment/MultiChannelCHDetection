@@ -141,5 +141,4 @@ def getDataSet(ds_path, resolution, train_months=None, compressed=False):
 
     map_valid = np.array(list(map_files))[valid_condition]
     mask_valid = np.array(list(mask_files))[valid_condition]
-
     return map_train, mask_train, map_valid, mask_valid

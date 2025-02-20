@@ -85,7 +85,7 @@ class Trainer:
         valid_mask_ds = MaskDataset(valid_files_mask, compressed=compressed)
 
         # compute norm
-        train_mask_ds = MaskDataset(train_files_mask)
+        train_mask_ds = MaskDataset(train_files_mask, compressed=compressed)
         masks = np.array([m for m in train_mask_ds])
         norm = np.sum(masks) / np.sum(1 - masks)
 
