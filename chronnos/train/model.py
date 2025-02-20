@@ -80,7 +80,7 @@ class Trainer:
             return
         # Data Set Generator
         train_files_map, train_files_mask, valid_files_map, valid_files_mask = getDataSet(self.ds_path, resolution_id, compressed=compressed)
-        train_ds = CombinedCHDataset(train_files_map, train_files_mask, channel=self.channels)
+        train_ds = CombinedCHDataset(train_files_map, train_files_mask, channel=self.channels, compressed=compressed)
         valid_map_ds = MapDataset(valid_files_map, channel=self.channels, compressed=compressed)
         valid_mask_ds = MaskDataset(valid_files_mask, compressed=compressed)
 

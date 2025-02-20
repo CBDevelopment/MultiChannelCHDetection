@@ -84,7 +84,7 @@ class MaskDataset(Dataset):
 
 
 class CombinedCHDataset(Dataset):
-    def __init__(self, map_files, mask_files, flip_prob=0.5, channel=None):
+    def __init__(self, map_files, mask_files, flip_prob=0.5, channel=None, compressed=False):
         """
         Load paired maps and masks for model training.
         :param map_files: list of npy files
@@ -94,8 +94,8 @@ class CombinedCHDataset(Dataset):
         """
         assert len(map_files) == len(mask_files), 'Number of files does not match!'
         self.flip_prob = flip_prob
-        self.map_ds = MapDataset(map_files, channel=channel)
-        self.mask_ds = MaskDataset(mask_files)
+        self.map_ds = MapDataset(map_files, channel=channel, compressed=compressed)
+        self.mask_ds = MaskDataset(mask_files, compressed=compressed)
         super().__init__()
 
     def __getitem__(self, index):
