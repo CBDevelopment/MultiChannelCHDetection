@@ -42,11 +42,11 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.opt, gamma=0.5)
         self.validation_callback = ValidationCallback(path=base_path)
 
-    def train(self, compressed=False):
+    def train(self, compressed=False, excluded_dates=None):
         logging.info('====================== START TRAINING CORE ======================')
         start_resolution = self.training_args['start_resolution']
         self.model.to(self.device)
-        self._trainStep(start_resolution, compressed)
+        self._trainStep(start_resolution, compressed, excluded_dates)
         for i in range(1, len(self.training_args['n_dims'])):
             self.lr_scheduler.step()
             resolution = start_resolution * 2 ** i
@@ -58,14 +58,14 @@ class Trainer:
                                                 list(self.model.up_block.parameters()) +
                                                 list(self.model.to_mask_fade.parameters()) +
                                                 list(self.model.from_image_fade.parameters())})
-            self._trainStep(resolution, compressed)
+            self._trainStep(resolution, compressed, excluded_dates)
 
             logging.info('====================== START FIXED %04d ======================' % (resolution))
             self.model.createFixed()
-            self._trainStep(resolution, compressed)
+            self._trainStep(resolution, compressed, excluded_dates)
         torch.save(self.model, os.path.join(self.base_path, 'final_model.pt'))
 
-    def _trainStep(self, resolution_id, compressed=False):
+    def _trainStep(self, resolution_id, compressed=False, excluded_dates=None):
         fade_flag = "fade" if self.model.fade is True else "non-fade"
         batch_size = 512 // resolution_id
         epochs = 5120 // resolution_id
@@ -80,7 +80,7 @@ class Trainer:
             self.validation_callback.history = state_dict['history']
             return
         # Data Set Generator
-        train_files_map, train_files_mask, valid_files_map, valid_files_mask = getDataSet(self.ds_path, resolution_id, compressed=compressed)
+        train_files_map, train_files_mask, valid_files_map, valid_files_mask = getDataSet(self.ds_path, resolution_id, compressed=compressed, excluded_dates=excluded_dates)
         train_ds = CombinedCHDataset(train_files_map, train_files_mask, channel=self.channels)
         valid_map_ds = MapDataset(valid_files_map, channel=self.channels, compressed=compressed)
         valid_mask_ds = MaskDataset(valid_files_mask, compressed=compressed)

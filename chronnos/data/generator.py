@@ -112,7 +112,7 @@ class CombinedCHDataset(Dataset):
         return len(self.map_ds)
 
 
-def getDataSet(ds_path, resolution, train_months=None, compressed=False):
+def getDataSet(ds_path, resolution, train_months=None, compressed=False, excluded_dates=None):
     """
     Group files for model training
     :param ds_path: base path to the converted files
@@ -127,6 +127,10 @@ def getDataSet(ds_path, resolution, train_months=None, compressed=False):
     else:
         mask_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'mask', '%d' % resolution), '*.npy')))
         map_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'map', '%d' % resolution), '*.npy')))
+
+    # Filter out files containing any of the exclude strings
+    mask_files = [f for f in mask_files if not any(excl in f for excl in excluded_dates)]
+    map_files = [f for f in map_files if not any(excl in f for excl in excluded_dates)]
 
     basename_mask = [os.path.basename(f) for f in mask_files]
     basename_map = [os.path.basename(f) for f in map_files]
