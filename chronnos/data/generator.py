@@ -6,7 +6,7 @@ import numpy as np
 from dateutil.parser import parse
 from torch.utils.data import Dataset
 
-from chronnos.data.convert import getMapData, get_local_correction_table
+from .convert import getMapData, get_local_correction_table
 
 
 class FITSDataset(Dataset):

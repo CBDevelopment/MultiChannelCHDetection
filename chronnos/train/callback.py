@@ -4,9 +4,8 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 
-from chronnos.data.convert import sdo_cmaps
-from chronnos.train.metric import iou, accuracy
-
+from ...chronnos.data.convert import sdo_cmaps
+from .metric import iou, accuracy
 
 class PlotCallback():
 

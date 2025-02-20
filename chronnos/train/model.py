@@ -8,10 +8,9 @@ from torch import nn
 from torch.nn import BCELoss
 from torch.utils.data import DataLoader
 
-from chronnos.data.convert import sdo_cmaps
-from chronnos.data.generator import CombinedCHDataset, MapDataset, MaskDataset, getDataSet
-from chronnos.train.callback import PlotCallback, ValidationCallback
-
+from ...chronnos.data.convert import sdo_cmaps
+from ...chronnos.data.generator import CombinedCHDataset, MapDataset, MaskDataset, getDataSet
+from ...chronnos.train.callback import PlotCallback, ValidationCallback
 
 class Trainer:
 
