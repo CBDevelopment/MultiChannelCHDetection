@@ -6,7 +6,7 @@ import numpy as np
 from dateutil.parser import parse
 from torch.utils.data import Dataset
 
-from chronnos.data.convert import getMapData, get_local_correction_table
+from .convert import getMapData, get_local_correction_table
 
 
 class FITSDataset(Dataset):
@@ -84,7 +84,7 @@ class MaskDataset(Dataset):
 
 
 class CombinedCHDataset(Dataset):
-    def __init__(self, map_files, mask_files, flip_prob=0.5, channel=None):
+    def __init__(self, map_files, mask_files, flip_prob=0.5, channel=None, compressed=False):
         """
         Load paired maps and masks for model training.
         :param map_files: list of npy files
@@ -94,8 +94,8 @@ class CombinedCHDataset(Dataset):
         """
         assert len(map_files) == len(mask_files), 'Number of files does not match!'
         self.flip_prob = flip_prob
-        self.map_ds = MapDataset(map_files, channel=channel)
-        self.mask_ds = MaskDataset(mask_files)
+        self.map_ds = MapDataset(map_files, channel=channel, compressed=compressed)
+        self.mask_ds = MaskDataset(mask_files, compressed=compressed)
         super().__init__()
 
     def __getitem__(self, index):
@@ -145,5 +145,4 @@ def getDataSet(ds_path, resolution, train_months=None, compressed=False, exclude
 
     map_valid = np.array(list(map_files))[valid_condition]
     mask_valid = np.array(list(mask_files))[valid_condition]
-
     return map_train, mask_train, map_valid, mask_valid

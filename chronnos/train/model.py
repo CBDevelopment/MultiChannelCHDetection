@@ -8,10 +8,9 @@ from torch import nn
 from torch.nn import BCELoss
 from torch.utils.data import DataLoader
 
-from chronnos.data.convert import sdo_cmaps
-from chronnos.data.generator import CombinedCHDataset, MapDataset, MaskDataset, getDataSet
-from chronnos.train.callback import PlotCallback, ValidationCallback
-
+from ...chronnos.data.convert import sdo_cmaps
+from ...chronnos.data.generator import CombinedCHDataset, MapDataset, MaskDataset, getDataSet
+from ...chronnos.train.callback import PlotCallback, ValidationCallback
 
 class Trainer:
 
@@ -86,7 +85,7 @@ class Trainer:
         valid_mask_ds = MaskDataset(valid_files_mask, compressed=compressed)
 
         # compute norm
-        train_mask_ds = MaskDataset(train_files_mask)
+        train_mask_ds = MaskDataset(train_files_mask, compressed=compressed)
         masks = np.array([m for m in train_mask_ds])
         norm = np.sum(masks) / np.sum(1 - masks)
 
