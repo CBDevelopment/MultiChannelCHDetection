@@ -45,7 +45,6 @@ def getMapData(file, resolution, correction_table=None, remove_off_disk=False, c
     """
     s_map = Map(file)
     s_map = prepMap(s_map, resolution)
-    #
     if isinstance(s_map, HMIMap): # truncate boundary for HMI images
         data = np.nan_to_num(s_map.data)
         hpc_coords = all_coordinates_from_map(s_map)
@@ -105,21 +104,28 @@ def prepMap(s_map: Map, resolution: int, padding_factor: float = 0.1):
     r_obs_pix = (1 + padding_factor) * r_obs_pix
     scale_factor = resolution / (2 * r_obs_pix.value)
     s_map = Map(np.nan_to_num(s_map.data).astype(np.float32), s_map.meta)
-    s_map = s_map.rotate(recenter=True, scale=scale_factor, missing=0, order=3)
+    #s_map = s_map.rotate(recenter=True, scale=scale_factor, missing=0, order=3)
+    # NOTE: This rotate was removed since it ruined the shape
     arcs_frame = (resolution / 2) * s_map.scale[0].value
-    s_map = s_map.submap(SkyCoord(-arcs_frame * u.arcsec, -arcs_frame * u.arcsec, frame=s_map.coordinate_frame),
-                         top_right=SkyCoord(arcs_frame * u.arcsec, arcs_frame * u.arcsec, frame=s_map.coordinate_frame))
+
+    # NOTE: removed below cropping line, creating off by one errors, works for other input sizes
+    #s_map = s_map.submap(SkyCoord(-arcs_frame * u.arcsec, -arcs_frame * u.arcsec, frame=s_map.coordinate_frame),
+    #                     top_right=SkyCoord(arcs_frame * u.arcsec, arcs_frame * u.arcsec, frame=s_map.coordinate_frame))
+
     # remove overlap after submap
     pad_x = s_map.data.shape[0] - resolution
     pad_y = s_map.data.shape[1] - resolution
-    s_map = s_map.submap(bottom_left=[pad_x // 2, pad_y // 2] * u.pix,
-                         top_right=[pad_x // 2 + resolution - 1, pad_y // 2 + resolution - 1] * u.pix)
-    #
-    s_map.meta['r_sun'] = s_map.rsun_obs.value / s_map.meta['cdelt1']
+
+    # Apply padding (adds padding symmetrically)
+    # NOTE: Values hardcoded to prevent off by one errors that were occuring
+    s_map = s_map.submap(bottom_left=[0, 0] * u.pix,
+                         top_right=[511, 511] * u.pix)
+    # NOTE: Removed r_sun info since no rotation now
+    #s_map.meta['r_sun'] = s_map.rsun_obs.value / s_map.meta['cdelt1']
+
     return s_map
 
-
-def convertMaps(grouped_files, converted_path, resolutions, n_workers=8, replace=False):
+def convertMaps(grouped_files, converted_path, resolutions, n_workers=8, replace=False):#
     """Convert FITS files for model training.
 
     :param grouped_files: list of FITS files in the format (channel, file)
@@ -137,7 +143,7 @@ def convertMaps(grouped_files, converted_path, resolutions, n_workers=8, replace
     with Pool(n_workers) as p:
         [None for _ in tqdm(p.imap_unordered(converter.convert, np.array(grouped_files).transpose()), total=len(grouped_files[0]))]
     # _convert(np.array(grouped_files).transpose()[0])
-
+    
 class _MapConverter:
 
     def __init__(self, converted_path, resolutions, correction_table, replace):
@@ -161,7 +167,7 @@ class _MapConverter:
                                 os.path.basename(c_files[0]).replace('.fits', '.npy'))
             block = (maps_data.shape[0] // resolution, maps_data.shape[1] // resolution, 1)
             map_data_reduced = block_reduce(maps_data, block, np.mean)
-            np.save(path, map_data_reduced.astype(np.float32))
+            np.save(path, map_data_reduced)
 
 def convertMasks(files, converted_path, resolutions, n_workers=8, replace=False):
     """Convert label masks for model training.
@@ -200,10 +206,10 @@ class _MaskConverter:
         data = data[..., None] # expand last dimension
         for resolution in self.resolutions:
             path = os.path.join(self.converted_path, '%d' % resolution,
-                                os.path.basename(file).replace('.fits.gz', '.npy'))
+                                os.path.basename(file).replace('.fits.gz', '.npy').replace('.fits', '.npy'))
             block = (data.shape[0] // resolution, data.shape[1] // resolution, 1)
             map_data_reduced = block_reduce(data, block, np.mean)
-            np.save(path, map_data_reduced.astype(np.float32))
+            np.save(path, map_data_reduced)
 
 def get_intersecting_files(path, dirs, months=None, years=None, extensions=None):
     """Find intersecting files in directory.
