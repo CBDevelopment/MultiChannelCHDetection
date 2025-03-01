@@ -45,7 +45,7 @@ class Trainer:
             self.model = CHRONNOS(training_args['n_dims'], training_args['n_convs'], training_args['image_channels'], 1,
                                 dropout=0.2)
         else: # Assumes in format where model is loaded, not just weights
-            self.model = torch.load(start_model_path)  # Replace PATH with the actual file path
+            self.model = torch.load(start_model_path, weights_only=False)  # Replace PATH with the actual file path
         
         self.opt = opt(self.model.parameters())
 
@@ -75,7 +75,7 @@ class Trainer:
             self.model.createFixed()
             self._trainStep(resolution, compressed=compressed, excluded_dates=excluded_dates)
         torch.save(self.model, os.path.join(self.base_path, self.final_model_name))
-
+    
     def _trainStep(self, resolution_id, compressed=False, excluded_dates=None):
         fade_flag = "fade" if self.model.fade is True else "non-fade"
         batch_size = 512 // resolution_id
