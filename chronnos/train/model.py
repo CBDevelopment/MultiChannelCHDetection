@@ -40,11 +40,12 @@ class Trainer:
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device is None else device
         logging.info('Using device: %s' % self.device)
-        self.model = CHRONNOS(training_args['n_dims'], training_args['n_convs'], training_args['image_channels'], 1,
-                              dropout=0.2)
-        if (start_model_path!=None):
-            state_dict = torch.load(start_model_path) 
-            self.model.load_state_dict(state_dict)
+
+        if (start_model_path==None):
+            self.model = CHRONNOS(training_args['n_dims'], training_args['n_convs'], training_args['image_channels'], 1,
+                                dropout=0.2)
+        else: # Assumes in format where model is loaded, not just weights
+            self.model = torch.load(start_model_path)  # Replace PATH with the actual file path
         
         self.opt = opt(self.model.parameters())
 
