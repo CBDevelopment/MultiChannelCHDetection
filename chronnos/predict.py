@@ -6,8 +6,8 @@ from matplotlib import pyplot as plt
 from sunpy.map import Map
 from tqdm import tqdm
 
-from chronnos.data.convert import get_intersecting_files, sdo_norms
-from chronnos.evaluate.detect import CHRONNOSDetector
+from ..chronnos.data.convert import get_intersecting_files, sdo_norms
+from ..chronnos.evaluate.detect import CHRONNOSDetector
 
 parser = argparse.ArgumentParser(description='Predict CHRONNOS masks from SDO FITS files')
 parser.add_argument('--data_path', type=str,

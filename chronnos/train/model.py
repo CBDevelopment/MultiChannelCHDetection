@@ -14,19 +14,26 @@ from ...chronnos.train.callback import PlotCallback, ValidationCallback
 
 class Trainer:
 
-    def __init__(self, base_path, data_path, device=None, channels=None, **training_args):
+    def __init__(self, base_path, data_path, device=None, channels=None, 
+                 opt=lambda params: torch.optim.Adam(params, lr=1e-3, betas=(0., 0.99), weight_decay=1e-8),
+                 start_model_path=None, 
+                 final_model_name="final_model.pt",
+                 **training_args):
         """Trainer for the CHRONNOS model
 
         :param str base_path: path for the training results
         :param str data_path: path to the converted data
         :param device: None to use the available device
         :param channels: Subset of channels to use for model training
+        :param final_model_name: Name of model to save (used for fine tuning)
         :param training_args: arguments for the model training, requires 'n_dims', 'n_convs', 'image_channels', 'start_resolution'
         """
         self.base_path = base_path
         self.ds_path = data_path
         self.training_args = training_args
         self.channels = channels
+        
+        self.final_model_name = final_model_name
 
         os.makedirs(base_path, exist_ok=True)
         print(f"Checking if base path {base_path} exists: {os.path.exists(base_path)}")
@@ -35,7 +42,11 @@ class Trainer:
         logging.info('Using device: %s' % self.device)
         self.model = CHRONNOS(training_args['n_dims'], training_args['n_convs'], training_args['image_channels'], 1,
                               dropout=0.2)
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=1e-3, betas=(0., 0.99), weight_decay=1e-8)
+        if (start_model_path!=None):
+            state_dict = torch.load(start_model_path) 
+            self.model.load_state_dict(state_dict)
+        
+        self.opt = opt(self.model.parameters())
 
         self.criterion = BCELoss(reduction='none')
         self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.opt, gamma=0.5)
@@ -62,7 +73,7 @@ class Trainer:
             logging.info('====================== START FIXED %04d ======================' % (resolution))
             self.model.createFixed()
             self._trainStep(resolution, compressed=compressed, excluded_dates=excluded_dates)
-        torch.save(self.model, os.path.join(self.base_path, 'final_model.pt'))
+        torch.save(self.model, os.path.join(self.base_path, self.final_model_name))
 
     def _trainStep(self, resolution_id, compressed=False, excluded_dates=None):
         fade_flag = "fade" if self.model.fade is True else "non-fade"

@@ -8,8 +8,8 @@ from sunpy.map import all_coordinates_from_map
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from chronnos.data.convert import buildFITS, get_intersecting_files
-from chronnos.data.generator import FITSDataset
+from ..data.convert import buildFITS, get_intersecting_files
+from ..data.generator import FITSDataset
 
 
 class CHRONNOSDetector:
@@ -88,7 +88,6 @@ class CHRONNOSDetector:
             for batch, ref in zip(map_loader, map_paths[3]):
                 batch = batch.to(self.device)
                 pred = self.model(batch).detach().cpu() >= 0.5
-                pred = pred[0, 0].numpy()  # remove batch and channel
                 s_map = buildFITS(pred, ref, reproject=reproject)
                 hpc_coords = all_coordinates_from_map(s_map)
                 r = np.sqrt(hpc_coords.Tx ** 2 + hpc_coords.Ty ** 2) / s_map.rsun_obs
