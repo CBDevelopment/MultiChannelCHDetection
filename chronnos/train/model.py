@@ -33,6 +33,7 @@ class Trainer:
         self.training_args = training_args
         self.channels = channels
         
+        self.start_model_path = start_model_path
         self.final_model_name = final_model_name
 
         os.makedirs(base_path, exist_ok=True)
@@ -58,6 +59,10 @@ class Trainer:
         start_resolution = self.training_args['start_resolution']
         self.model.to(self.device)
         self._trainStep(start_resolution, compressed=compressed, excluded_dates=excluded_dates)
+        if (self.start_model_path!=None): # End here in this case of finetuning
+            torch.save(self.model, os.path.join(self.base_path, self.final_model_name))
+            return 
+        
         for i in range(1, len(self.training_args['n_dims'])):
             self.lr_scheduler.step()
             resolution = start_resolution * 2 ** i
