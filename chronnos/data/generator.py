@@ -130,7 +130,7 @@ def getDataSet(ds_path, resolution, train_months=None, compressed=False, exclude
         map_files = sorted(glob.glob(os.path.join(os.path.join(ds_path, 'map', '%d' % resolution), '*.npy')))
 
     # Filter out files containing any of the exclude strings
-    if excluded_dates!=None: # If None no dates excluded
+    if excluded_dates != None: # If None no dates excluded
         mask_files = [f for f in mask_files if not any(excl in os.path.basename(f) for excl in excluded_dates)]
         map_files = [f for f in map_files if not any(excl in os.path.basename(f) for excl in excluded_dates)]
 
